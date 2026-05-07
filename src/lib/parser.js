@@ -10,7 +10,9 @@ let pdfjsLib = null;
 
 const loadPdfJs = async () => {
   if (pdfjsLib) return pdfjsLib;
+  // Použijeme pdfjs-dist v3.11.174 - default export přes hlavní entry point
   pdfjsLib = await import('pdfjs-dist');
+  // Worker - načteme z CDN, je to spolehlivější než lokální bundle
   pdfjsLib.GlobalWorkerOptions.workerSrc =
     'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
   return pdfjsLib;

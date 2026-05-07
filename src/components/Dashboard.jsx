@@ -23,6 +23,7 @@ export default function Dashboard({ onLogout }) {
   const [showTransfers, setShowTransfers] = useState(false);
   const [debugText, setDebugText] = useState('');
   const [showRawText, setShowRawText] = useState(false);
+  const [expandedCategory, setExpandedCategory] = useState(null);
 
   const [patterns, setPatterns] = useState([]);
   const [accounts, setAccounts] = useState([]);
@@ -651,7 +652,10 @@ export default function Dashboard({ onLogout }) {
 
             {/* Categories */}
             <div className="card" style={{ padding: '28px', marginBottom: '12px' }}>
-              <h3 className="display" style={{ margin: '0 0 24px', fontSize: '28px', fontWeight: 600 }}>Kategorie & limity</h3>
+              <h3 className="display" style={{ margin: '0 0 8px', fontSize: '28px', fontWeight: 600 }}>Kategorie & limity</h3>
+              <div className="mono" style={{ fontSize: '11px', color: '#8A8377', marginBottom: '20px', textTransform: 'uppercase', letterSpacing: '1.5px' }}>
+                Klikni na kategorii pro detail transakcí
+              </div>
               <div style={{ display: 'grid', gap: '8px' }}>
                 {allCategories.map((cat, i) => {
                   const st = styleFor(cat, i);
@@ -660,23 +664,80 @@ export default function Dashboard({ onLogout }) {
                   const pct = limit > 0 ? (spent / limit) * 100 : 0;
                   const danger = pct >= 90;
                   const warning = pct >= 75;
+                  const isExpanded = expandedCategory === cat;
+                  // Transakce této kategorie, seřazené od největší
+                  const catTransactions = expenses
+                    .filter(t => t.category === cat)
+                    .sort((a, b) => b.amount - a.amount);
+
                   return (
-                    <div key={cat} style={{ background: '#0F0F0E', padding: '14px 18px', borderLeft: `6px solid ${st.color}`, border: '1px solid #2A2622' }}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: '6px', flexWrap: 'wrap', gap: '8px' }}>
-                        <div className="display" style={{ fontSize: '18px', fontWeight: 600 }}>
-                          {st.emoji} {cat}
-                          {danger && <AlertTriangle size={14} style={{ display: 'inline', marginLeft: '8px', color: '#D62828' }} />}
+                    <div key={cat} style={{ background: '#0F0F0E', borderLeft: `6px solid ${st.color}`, border: '1px solid #2A2622', overflow: 'hidden' }}>
+                      <button
+                        onClick={() => setExpandedCategory(isExpanded ? null : cat)}
+                        style={{
+                          width: '100%',
+                          padding: '14px 18px',
+                          background: 'transparent',
+                          color: '#EAE3D2',
+                          textAlign: 'left',
+                          cursor: 'pointer',
+                          display: 'block'
+                        }}
+                      >
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: '6px', flexWrap: 'wrap', gap: '8px' }}>
+                          <div className="display" style={{ fontSize: '18px', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                            {st.emoji} {cat}
+                            {danger && <AlertTriangle size={14} style={{ color: '#D62828' }} />}
+                            <span className="mono" style={{ fontSize: '11px', color: '#8A8377', fontWeight: 400, marginLeft: '4px' }}>
+                              ({catTransactions.length} {catTransactions.length === 1 ? 'položka' : catTransactions.length < 5 ? 'položky' : 'položek'})
+                            </span>
+                            {isExpanded ? <ChevronUp size={16} style={{ color: '#8A8377' }} /> : <ChevronDown size={16} style={{ color: '#8A8377' }} />}
+                          </div>
+                          <div className="mono" style={{ fontSize: '12px' }}>
+                            <strong style={{ color: danger ? '#D62828' : warning ? '#F77F00' : '#EAE3D2', fontSize: '14px' }}>
+                              {spent.toLocaleString('cs-CZ', { maximumFractionDigits: 0 })} Kč
+                            </strong>
+                            {limit > 0 ? <span style={{ color: '#8A8377' }}> / {limit.toLocaleString('cs-CZ')} Kč ({pct.toFixed(0)} %)</span> : <span style={{ color: '#8A8377' }}> · bez limitu</span>}
+                          </div>
                         </div>
-                        <div className="mono" style={{ fontSize: '12px' }}>
-                          <strong style={{ color: danger ? '#D62828' : warning ? '#F77F00' : '#EAE3D2', fontSize: '14px' }}>
-                            {spent.toLocaleString('cs-CZ', { maximumFractionDigits: 0 })} Kč
-                          </strong>
-                          {limit > 0 ? <span style={{ color: '#8A8377' }}> / {limit.toLocaleString('cs-CZ')} Kč ({pct.toFixed(0)} %)</span> : <span style={{ color: '#8A8377' }}> · bez limitu</span>}
-                        </div>
-                      </div>
-                      {limit > 0 && (
-                        <div style={{ height: '4px', background: '#2A2622' }}>
-                          <div style={{ width: `${Math.min(pct, 100)}%`, height: '100%', background: danger ? '#D62828' : warning ? '#F77F00' : st.color, transition: 'width 0.5s' }} />
+                        {limit > 0 && (
+                          <div style={{ height: '4px', background: '#2A2622' }}>
+                            <div style={{ width: `${Math.min(pct, 100)}%`, height: '100%', background: danger ? '#D62828' : warning ? '#F77F00' : st.color, transition: 'width 0.5s' }} />
+                          </div>
+                        )}
+                      </button>
+
+                      {/* Rozbalený seznam transakcí */}
+                      {isExpanded && (
+                        <div className="slide-up" style={{ padding: '4px 18px 18px', borderTop: '1px solid #2A2622', background: '#0a0a09' }}>
+                          {catTransactions.length === 0 ? (
+                            <div style={{ padding: '14px 0', color: '#8A8377', fontSize: '13px', fontStyle: 'italic' }}>
+                              Žádné transakce v této kategorii.
+                            </div>
+                          ) : (
+                            <div>
+                              {catTransactions.map(t => (
+                                <div key={t.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 0', borderBottom: '1px solid #1f1d1a', gap: '12px' }}>
+                                  <div style={{ flex: 1, minWidth: 0 }}>
+                                    <div style={{ fontSize: '13px', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                      {t.merchant}
+                                    </div>
+                                    <div className="mono" style={{ fontSize: '10px', color: '#8A8377', marginTop: '2px' }}>
+                                      {t.date}{t.rbType ? ' · ' + t.rbType : ''}{t.accountNumber ? ' · ' + t.accountNumber : ''}
+                                    </div>
+                                  </div>
+                                  <div className="display" style={{ fontSize: '16px', fontWeight: 600, flexShrink: 0 }}>
+                                    −{t.amount.toLocaleString('cs-CZ', { maximumFractionDigits: 0 })} Kč
+                                  </div>
+                                </div>
+                              ))}
+                              <div className="mono" style={{ paddingTop: '12px', textAlign: 'right', fontSize: '11px', color: '#8A8377', textTransform: 'uppercase', letterSpacing: '1px' }}>
+                                Celkem: <strong style={{ color: '#EAE3D2', fontSize: '13px' }}>
+                                  {spent.toLocaleString('cs-CZ', { maximumFractionDigits: 0 })} Kč
+                                </strong>
+                              </div>
+                            </div>
+                          )}
                         </div>
                       )}
                     </div>
