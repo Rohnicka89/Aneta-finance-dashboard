@@ -10,13 +10,9 @@ let pdfjsLib = null;
 
 const loadPdfJs = async () => {
   if (pdfjsLib) return pdfjsLib;
-  // Importuj jako ES module - v Vite to funguje
-  pdfjsLib = await import('pdfjs-dist/build/pdf.mjs');
-  // Worker URL - musí ukazovat na worker bundle
-  pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
-    'pdfjs-dist/build/pdf.worker.mjs',
-    import.meta.url
-  ).toString();
+  pdfjsLib = await import('pdfjs-dist');
+  pdfjsLib.GlobalWorkerOptions.workerSrc =
+    'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
   return pdfjsLib;
 };
 
