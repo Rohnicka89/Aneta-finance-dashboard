@@ -538,19 +538,73 @@ export default function Dashboard({ onLogout }) {
               <div className="card" style={{ padding: '28px' }}>
                 <h3 className="display" style={{ margin: '0 0 20px', fontSize: '24px', fontWeight: 600 }}>Útraty podle kategorií</h3>
                 {pieData.length > 0 ? (
-                  <ResponsiveContainer width="100%" height={300}>
-                    <PieChart>
-                      <Pie data={pieData} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={110} label={(e) => e.percent > 0.05 ? `${(e.percent * 100).toFixed(0)}%` : ''} labelLine={false}>
-                        {pieData.map((entry, i) => <Cell key={i} fill={entry.color} stroke="#0F0F0E" strokeWidth={2} />)}
-                      </Pie>
-                      <Tooltip
-                        contentStyle={{ background: '#1A1816', border: '1px solid #E5B73B', color: '#EAE3D2', fontFamily: 'JetBrains Mono, monospace', fontSize: '12px' }}
-                        itemStyle={{ color: '#EAE3D2' }}
-                        labelStyle={{ color: '#E5B73B', fontWeight: 700 }}
-                        formatter={(v, name) => [`${v.toLocaleString('cs-CZ')} Kč`, name]}
-                      />
-                    </PieChart>
-                  </ResponsiveContainer>
+                  <>
+                    <ResponsiveContainer width="100%" height={260}>
+                      <PieChart>
+                        <Pie data={pieData} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={100} label={(e) => e.percent > 0.05 ? `${(e.percent * 100).toFixed(0)}%` : ''} labelLine={false}>
+                          {pieData.map((entry, i) => <Cell key={i} fill={entry.color} stroke="#0F0F0E" strokeWidth={2} />)}
+                        </Pie>
+                        <Tooltip
+                          contentStyle={{ background: '#1A1816', border: '1px solid #E5B73B', color: '#EAE3D2', fontFamily: 'JetBrains Mono, monospace', fontSize: '12px' }}
+                          itemStyle={{ color: '#EAE3D2' }}
+                          labelStyle={{ color: '#E5B73B', fontWeight: 700 }}
+                          formatter={(v, name) => [`${v.toLocaleString('cs-CZ')} Kč`, name]}
+                        />
+                      </PieChart>
+                    </ResponsiveContainer>
+                    {/* Vlastní legenda s barvami, názvy a částkami */}
+                    <div style={{ marginTop: '20px', display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: '6px 12px' }}>
+                      {pieData.map((entry, i) => {
+                        const total = pieData.reduce((s, x) => s + x.value, 0);
+                        const pct = total > 0 ? (entry.value / total) * 100 : 0;
+                        const st = styleFor(entry.name, i);
+                        return (
+                          <button
+                            key={entry.name}
+                            onClick={() => setExpandedCategory(expandedCategory === entry.name ? null : entry.name)}
+                            style={{
+                              background: 'transparent',
+                              padding: '6px 8px',
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '8px',
+                              border: '1px solid transparent',
+                              borderRadius: '4px',
+                              cursor: 'pointer',
+                              transition: 'all 0.15s',
+                              textAlign: 'left',
+                              minWidth: 0
+                            }}
+                            onMouseEnter={(e) => e.currentTarget.style.background = '#0F0F0E'}
+                            onMouseLeave={(e) => e.currentTarget.style.background = 'transparent'}
+                          >
+                            <div style={{
+                              width: '12px',
+                              height: '12px',
+                              background: entry.color,
+                              borderRadius: '2px',
+                              flexShrink: 0
+                            }} />
+                            <div style={{ flex: 1, minWidth: 0 }}>
+                              <div style={{
+                                fontSize: '12px',
+                                fontWeight: 500,
+                                color: '#EAE3D2',
+                                overflow: 'hidden',
+                                textOverflow: 'ellipsis',
+                                whiteSpace: 'nowrap'
+                              }}>
+                                {st.emoji} {entry.name}
+                              </div>
+                              <div className="mono" style={{ fontSize: '10px', color: '#8A8377', marginTop: '1px' }}>
+                                {entry.value.toLocaleString('cs-CZ', { maximumFractionDigits: 0 })} Kč · {pct.toFixed(0)}%
+                              </div>
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </>
                 ) : <div style={{ height: 300, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#8A8377' }}>Žádné útraty</div>}
               </div>
               <div className="card" style={{ padding: '28px' }}>
