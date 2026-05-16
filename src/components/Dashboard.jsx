@@ -4,7 +4,7 @@ import { Upload, Settings, X, Skull, ChevronDown, ChevronUp, AlertTriangle, Arro
 
 import { extractPdfText, parseRaiffkaText } from '../lib/parser.js';
 import { fetchCiselnik, categorize } from '../lib/ciselnik.js';
-import { styleFor } from '../lib/categories.js';
+import { styleFor, CATEGORY_STYLE } from '../lib/categories.js';
 import { getRoast, getCategoryRoast } from '../lib/roasts.js';
 import * as api from '../lib/api.js';
 
@@ -72,19 +72,16 @@ export default function Dashboard({ onLogout }) {
       const data = await fetchCiselnik();
       setPatterns(data.patterny);
       setAccounts(data.ucty);
-      if (Object.keys(data.limity).length > 0) {
-        const newLimits = { ...categoryLimits, ...data.limity };
-        setCategoryLimits(newLimits);
-        await api.saveSettings({ totalLimit, categoryLimits: newLimits });
-      }
+      // POZN: Limity ze Sheets se IGNORUJÍ - limity jsou master v D1
+      // (V Settings je tlačítko "Import limitů ze Sheets" pro jednorázový import)
       localStorage.setItem('cache_ciselnik', JSON.stringify({
         patterny: data.patterny,
         ucty: data.ucty,
-        limity: data.limity,
+        limity: data.limity, // uchováváme pro případný ruční import
         timestamp: Date.now()
       }));
       setCiselnikLastUpdate(new Date());
-      const summary = `✓ Číselník: ${data.patterny.length} patternů, ${data.ucty.length} účtů, ${Object.keys(data.limity).length} limitů`;
+      const summary = `✓ Číselník: ${data.patterny.length} patternů, ${data.ucty.length} účtů`;
       const errorPart = data.errors.length > 0 ? ` ⚠️ Chyby: ${data.errors.join(', ')}` : '';
       setCiselnikStatus(summary + errorPart);
       // Po načtení překategorizuj
@@ -137,6 +134,24 @@ export default function Dashboard({ onLogout }) {
 
   const allCategories = useMemo(() => Array.from(new Set(expenses.map(t => t.category))).sort(), [expenses]);
 
+  // Kategorie seřazené dle % limitu (nejvyšší nahoře)
+  // Kategorie bez limitu jdou až nakonec, seřazené dle částky
+  const categoriesSorted = useMemo(() => {
+    return [...allCategories].sort((a, b) => {
+      const spentA = categorySpending[a] || 0;
+      const spentB = categorySpending[b] || 0;
+      const limitA = categoryLimits[a] || 0;
+      const limitB = categoryLimits[b] || 0;
+      const pctA = limitA > 0 ? (spentA / limitA) * 100 : -1;
+      const pctB = limitB > 0 ? (spentB / limitB) * 100 : -1;
+      // -1 znamená "bez limitu" — ty seřaď nakonec dle částky
+      if (pctA === -1 && pctB === -1) return spentB - spentA;
+      if (pctA === -1) return 1;
+      if (pctB === -1) return -1;
+      return pctB - pctA;
+    });
+  }, [allCategories, categorySpending, categoryLimits]);
+
   const subscriptions = useMemo(() => {
     const subs = expenses.filter(t => t.isSubscription || t.category === 'Předplatné');
     const grouped = {};
@@ -151,6 +166,18 @@ export default function Dashboard({ onLogout }) {
 
   const subsTotal = subscriptions.reduce((s, x) => s + x.total, 0);
 
+  // Texty hlášek podle úrovně překročení
+  // < 75%   = nezobrazuje se (klidné)
+  // 75-94%  = "Blíží se k limitu" (oranžová)
+  // 95-104% = "Dosahuješ limitu" / "Limit dosažen" (oranžová → červená)
+  // 105%+   = "Limit překročen" + peprná hláška (červená)
+  const getWarningLevel = (pct) => {
+    if (pct >= 105) return { level: 'exceeded', label: 'Limit překročen', emoji: '🚨' };
+    if (pct >= 95) return { level: 'reached',  label: 'Dosaženo limitu', emoji: '⚠️' };
+    if (pct >= 75) return { level: 'approaching', label: 'Blíží se k limitu', emoji: '⏰' };
+    return null;
+  };
+
   const categoryWarnings = useMemo(() => {
     return allCategories
       .map(cat => {
@@ -158,8 +185,14 @@ export default function Dashboard({ onLogout }) {
         const limit = categoryLimits[cat];
         if (!limit || limit <= 0) return null;
         const pct = (spent / limit) * 100;
-        if (pct < 75) return null;
-        return { cat, pct, spent, limit, roast: getCategoryRoast(cat, limit) };
+        const w = getWarningLevel(pct);
+        if (!w) return null;
+        return {
+          cat, pct, spent, limit,
+          ...w,
+          // Peprná hláška jen u skutečně překročených (>105%)
+          roast: w.level === 'exceeded' ? getCategoryRoast(cat, limit) : null
+        };
       })
       .filter(Boolean)
       .sort((a, b) => b.pct - a.pct);
@@ -181,50 +214,90 @@ export default function Dashboard({ onLogout }) {
   }, [totalPercent, totalLimit, loading, selectedMonth]);
 
   const handleFileUpload = async (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    if (!file.name.toLowerCase().endsWith('.pdf')) {
-      setParseError('Nahraj prosím PDF soubor.');
+    const files = Array.from(e.target.files || []);
+    if (files.length === 0) return;
+    const pdfs = files.filter(f => f.name.toLowerCase().endsWith('.pdf'));
+    if (pdfs.length === 0) {
+      setParseError('Nahraj prosím PDF soubory.');
       return;
     }
+    if (pdfs.length < files.length) {
+      console.warn(`Přeskočeno ${files.length - pdfs.length} ne-PDF souborů`);
+    }
+
     setParsing(true);
     setParseError(null);
     setDebugText('');
-    setParseStatus(`📄 ${file.name} (${Math.round(file.size/1024)} KB)`);
 
-    try {
-      setParseStatus('⏳ Krok 1/3: Čtu PDF…');
-      await new Promise(r => setTimeout(r, 50));
-      const text = await extractPdfText(file);
-      setParseStatus(`⏳ Krok 2/3: Extrahováno ${text.length} znaků`);
-      setDebugText(text);
-      if (!text || text.length < 100) {
-        const msg = `PDF má jen ${text.length} znaků - asi je to scan, ne text.`;
-        setParseError(msg);
-        setParseStatus('❌ ' + msg);
-        setParsing(false);
-        return;
+    let totalParsed = 0;
+    let totalNew = 0;
+    let totalDuplicate = 0;
+    const errors = [];
+
+    // ID transakcí, které už máme (z DB)
+    const existingIds = new Set(transactions.map(t => t.id));
+    const allNewTransactions = [];
+
+    for (let idx = 0; idx < pdfs.length; idx++) {
+      const file = pdfs[idx];
+      setParseStatus(`📄 ${idx + 1}/${pdfs.length}: ${file.name}`);
+
+      try {
+        await new Promise(r => setTimeout(r, 50));
+        const text = await extractPdfText(file);
+
+        if (!text || text.length < 100) {
+          errors.push(`${file.name}: PDF má jen ${text.length} znaků - asi je to scan.`);
+          continue;
+        }
+
+        if (idx === pdfs.length - 1) setDebugText(text); // jen pro poslední, ať se nezahltí
+
+        const txs = parseRaiffkaText(text, patterns, accounts);
+        totalParsed += txs.length;
+
+        if (txs.length === 0) {
+          errors.push(`${file.name}: žádné transakce nerozpoznány.`);
+          continue;
+        }
+
+        // Dedup proti existujícím + proti právě nahraným v tomto batch
+        for (const tx of txs) {
+          if (existingIds.has(tx.id)) {
+            totalDuplicate++;
+          } else {
+            existingIds.add(tx.id);
+            allNewTransactions.push(tx);
+            totalNew++;
+          }
+        }
+      } catch (err) {
+        console.error(err);
+        errors.push(`${file.name}: ${err.message || err.toString()}`);
       }
-      setParseStatus('⏳ Krok 3/3: Parsuji transakce…');
-      const newTx = parseRaiffkaText(text, patterns, accounts);
-      if (newTx.length === 0) {
-        setParseError('Žádné transakce nerozpoznány. Klikni na DEBUG.');
-        setParseStatus('❌ Žádné transakce.');
-        setParsing(false);
-        return;
-      }
-      const existingIds = new Set(transactions.map(t => t.id));
-      const newOnes = newTx.filter(t => !existingIds.has(t.id));
-      const merged = [...transactions, ...newOnes];
+    }
+
+    if (allNewTransactions.length > 0) {
+      const merged = [...transactions, ...allNewTransactions];
       setTransactions(merged);
       await api.saveTransactions(merged);
-      setParseStatus(`✅ Načteno ${newOnes.length} nových z ${newTx.length} celkem.`);
-    } catch (err) {
-      console.error(err);
-      const msg = `Chyba: ${err.message || err.toString()}`;
-      setParseError(msg);
-      setParseStatus('❌ ' + msg);
     }
+
+    // Souhrnný status
+    let summary = '';
+    if (pdfs.length === 1) {
+      summary = `Načteno ${totalNew} nových z ${totalParsed} (${totalDuplicate} duplikátů).`;
+    } else {
+      summary = `${pdfs.length} PDF · ${totalNew} nových · ${totalParsed - totalNew} duplikátů`;
+    }
+
+    if (errors.length > 0) {
+      setParseError(`Některé soubory selhaly:\n${errors.join('\n')}`);
+      setParseStatus(`⚠️ ${summary}, ${errors.length} chyb`);
+    } else {
+      setParseStatus(`✅ ${summary}`);
+    }
+
     setParsing(false);
     if (e.target) e.target.value = '';
   };
@@ -251,6 +324,24 @@ export default function Dashboard({ onLogout }) {
     setCategoryLimits(merged);
     await api.saveSettings({ totalLimit, categoryLimits: merged });
   };
+
+  // Jednorázový import limitů z Google Sheets (přepíše existující)
+  const importLimitsFromSheets = async () => {
+    if (!confirm('Tohle nahradí všechny aktuální limity hodnotami z tvého Google Sheets. Pokračovat?')) return;
+    try {
+      const data = await fetchCiselnik();
+      if (Object.keys(data.limity).length === 0) {
+        alert('V Google Sheets nejsou žádné limity.');
+        return;
+      }
+      setCategoryLimits(data.limity);
+      await api.saveSettings({ totalLimit, categoryLimits: data.limity });
+      alert(`✓ Importováno ${Object.keys(data.limity).length} limitů ze Sheets.`);
+    } catch (e) {
+      alert(`Chyba: ${e.message}`);
+    }
+  };
+
   const clearAllData = async () => {
     if (!confirm('Opravdu smazat VŠECHNY transakce? Tuhle akci nelze vrátit.')) return;
     setTransactions([]);
@@ -294,7 +385,15 @@ export default function Dashboard({ onLogout }) {
   }
 
   return (
-    <div style={{ minHeight: '100dvh', background: '#0F0F0E', color: '#EAE3D2', padding: '24px' }}>
+    <div style={{
+      minHeight: '100dvh',
+      background: '#0F0F0E',
+      color: '#EAE3D2',
+      paddingTop: 'calc(24px + env(safe-area-inset-top))',
+      paddingRight: 'calc(24px + env(safe-area-inset-right))',
+      paddingBottom: 'calc(24px + env(safe-area-inset-bottom))',
+      paddingLeft: 'calc(24px + env(safe-area-inset-left))'
+    }}>
       {/* Roast Modal */}
       {activeRoast && (
         <div style={{ position: 'fixed', inset: 0, background: 'rgba(10,10,10,0.92)', zIndex: 100, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '20px' }}>
@@ -325,7 +424,7 @@ export default function Dashboard({ onLogout }) {
               Kam to <em style={{ color: '#E5B73B', fontStyle: 'italic', fontWeight: 700 }}>mizí</em>,<br/>Aneto?
             </h1>
             <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-              <input ref={fileInputRef} type="file" accept="application/pdf,.pdf" onChange={handleFileUpload} style={{ position: 'absolute', left: '-9999px' }} />
+              <input ref={fileInputRef} type="file" accept="application/pdf,.pdf" multiple onChange={handleFileUpload} style={{ position: 'absolute', left: '-9999px' }} />
               <button onClick={triggerFileSelect} disabled={parsing} style={{ background: '#E5B73B', color: '#0F0F0E', padding: '14px 22px', display: 'inline-flex', alignItems: 'center', gap: '8px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '1.5px', fontSize: '12px', opacity: parsing ? 0.7 : 1 }}>
                 <Upload size={16} />
                 {parsing ? 'Parsuji…' : 'Nahrát PDF'}
@@ -390,19 +489,39 @@ export default function Dashboard({ onLogout }) {
           </pre>
         )}
 
-        {/* Months */}
+        {/* Months - select dropdown */}
         {availableMonths.length > 0 && (
-          <div style={{ display: 'flex', gap: '8px', marginBottom: '32px', flexWrap: 'wrap' }}>
-            {availableMonths.map(m => (
-              <button key={m} onClick={() => setSelectedMonth(m)} className="mono" style={{
-                background: m === selectedMonth ? '#EAE3D2' : 'transparent',
-                color: m === selectedMonth ? '#0F0F0E' : '#EAE3D2',
-                border: '1.5px solid #EAE3D2', padding: '8px 16px',
-                fontSize: '11px', fontWeight: 600, letterSpacing: '1.5px', textTransform: 'uppercase'
-              }}>
-                {new Date(m + '-01').toLocaleDateString('cs-CZ', { month: 'long', year: 'numeric' })}
-              </button>
-            ))}
+          <div style={{ marginBottom: '32px', display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
+            <label className="mono" style={{ fontSize: '11px', letterSpacing: '2px', textTransform: 'uppercase', color: '#E5B73B' }}>
+              Období:
+            </label>
+            <select
+              value={selectedMonth}
+              onChange={(e) => setSelectedMonth(e.target.value)}
+              className="mono"
+              style={{
+                background: '#1A1816',
+                color: '#EAE3D2',
+                border: '1.5px solid #EAE3D2',
+                padding: '10px 14px',
+                fontSize: '13px',
+                fontWeight: 600,
+                letterSpacing: '1px',
+                textTransform: 'uppercase',
+                fontFamily: 'JetBrains Mono, monospace',
+                cursor: 'pointer',
+                minWidth: '200px'
+              }}
+            >
+              {availableMonths.map(m => (
+                <option key={m} value={m} style={{ background: '#1A1816', color: '#EAE3D2' }}>
+                  {new Date(m + '-01').toLocaleDateString('cs-CZ', { month: 'long', year: 'numeric' })}
+                </option>
+              ))}
+            </select>
+            <span className="mono" style={{ fontSize: '11px', color: '#8A8377' }}>
+              {availableMonths.length} {availableMonths.length === 1 ? 'měsíc' : availableMonths.length < 5 ? 'měsíce' : 'měsíců'} s daty
+            </span>
           </div>
         )}
 
@@ -420,23 +539,49 @@ export default function Dashboard({ onLogout }) {
               <input type="number" value={totalLimit} onChange={(e) => updateTotalLimit(e.target.value)}
                 className="display" style={{ background: '#0F0F0E', color: '#EAE3D2', border: '2px solid #2A2622', padding: '14px 18px', fontSize: '36px', fontWeight: 600, width: '320px', maxWidth: '100%' }} />
             </div>
-            {allCategories.length > 0 && (
+            {(() => {
+              // V Settings ukazujeme všechny dostupné kategorie:
+              //  1. ty, co existují v CATEGORY_STYLE (master list)
+              //  2. plus všechny, co máme v transakcích (pro jistotu)
+              //  3. plus všechny, co máme v categoryLimits (pro úplnost)
+              const allCats = Array.from(new Set([
+                ...Object.keys(CATEGORY_STYLE).filter(c => c !== 'Nezařazeno' && c !== 'Příjem' && c !== 'Převod' && c !== 'Výplata' && c !== 'Bankovní poplatky'),
+                ...allCategories,
+                ...Object.keys(categoryLimits)
+              ])).sort();
+              return (
               <>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '14px', flexWrap: 'wrap', gap: '8px' }}>
                   <div className="mono" style={{ fontSize: '11px', letterSpacing: '2px', textTransform: 'uppercase', color: '#E5B73B' }}>
-                    Limity kategorií ({allCategories.length})
+                    Limity kategorií ({allCats.length})
                   </div>
-                  <button onClick={initDefaultLimits} style={{ background: '#E5B73B', color: '#0F0F0E', padding: '10px 16px', fontWeight: 700, fontSize: '11px', textTransform: 'uppercase', letterSpacing: '1px' }}>
-                    Nastav výchozí
-                  </button>
+                  <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                    <button onClick={importLimitsFromSheets} title="Jednorázový import limitů z tvého Google Sheets (přepíše stávající)"
+                      style={{ background: 'transparent', color: '#9B5DE5', border: '2px solid #9B5DE5', padding: '8px 14px', fontWeight: 700, fontSize: '11px', textTransform: 'uppercase', letterSpacing: '1px', cursor: 'pointer' }}>
+                      📥 Import ze Sheets
+                    </button>
+                    <button onClick={initDefaultLimits} style={{ background: '#E5B73B', color: '#0F0F0E', padding: '10px 16px', fontWeight: 700, fontSize: '11px', textTransform: 'uppercase', letterSpacing: '1px' }}>
+                      Nastav výchozí
+                    </button>
+                  </div>
+                </div>
+                <div className="mono" style={{ fontSize: '10px', color: '#8A8377', marginBottom: '12px' }}>
+                  💡 Limity jsou uložené v dashboardu (synchronizace mezi zařízeními). Sheets je jen na patterny a účty.
                 </div>
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: '10px', marginBottom: '24px' }}>
-                  {allCategories.map((cat, i) => {
+                  {allCats.map((cat, i) => {
                     const st = styleFor(cat, i);
+                    const spent = categorySpending[cat] || 0;
+                    const hasData = spent > 0;
                     return (
-                      <div key={cat} style={{ background: '#0F0F0E', border: '1px solid #2A2622', padding: '14px', borderLeft: `5px solid ${st.color}` }}>
-                        <div style={{ fontSize: '13px', fontWeight: 600, marginBottom: '8px' }}>
-                          {st.emoji} {cat}
+                      <div key={cat} style={{ background: '#0F0F0E', border: '1px solid #2A2622', padding: '14px', borderLeft: `5px solid ${st.color}`, opacity: hasData ? 1 : 0.7 }}>
+                        <div style={{ fontSize: '13px', fontWeight: 600, marginBottom: '4px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '8px' }}>
+                          <span>{st.emoji} {cat}</span>
+                          {hasData && (
+                            <span className="mono" style={{ fontSize: '10px', color: '#8A8377' }}>
+                              {spent.toLocaleString('cs-CZ', { maximumFractionDigits: 0 })} Kč
+                            </span>
+                          )}
                         </div>
                         <input type="number" placeholder="Limit (Kč)" value={categoryLimits[cat] || ''}
                           onChange={(e) => updateCategoryLimit(cat, e.target.value)}
@@ -446,7 +591,8 @@ export default function Dashboard({ onLogout }) {
                   })}
                 </div>
               </>
-            )}
+              );
+            })()}
             <button onClick={clearAllData} style={{ background: 'transparent', color: '#D62828', border: '2px solid #D62828', padding: '12px 20px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '1px', fontSize: '12px', display: 'inline-flex', alignItems: 'center', gap: '8px' }}>
               <Trash2 size={14} /> Smazat všechna data
             </button>
@@ -511,25 +657,35 @@ export default function Dashboard({ onLogout }) {
               </div>
             </div>
 
-            {/* Category warnings */}
+            {/* Category warnings - 3 úrovně: blíží se / dosaženo / překročeno */}
             {categoryWarnings.length > 0 && (
               <div style={{ display: 'grid', gap: '8px', marginBottom: '12px' }}>
-                {categoryWarnings.map(w => (
-                  <div key={w.cat} className="slide-up" style={{
-                    background: w.pct >= 100 ? '#D62828' : '#F77F00', color: '#fff',
-                    padding: '16px 20px', display: 'flex', alignItems: 'center', gap: '14px'
-                  }}>
-                    <AlertTriangle size={22} style={{ flexShrink: 0 }} />
-                    <div style={{ flex: 1 }}>
-                      <div className="mono" style={{ fontWeight: 800, fontSize: '11px', textTransform: 'uppercase', letterSpacing: '1.5px', marginBottom: '4px', opacity: 0.9 }}>
-                        {w.cat} · {w.pct.toFixed(0)} % · {w.spent.toLocaleString('cs-CZ')}/{w.limit.toLocaleString('cs-CZ')} Kč
-                      </div>
-                      <div className="display" style={{ fontSize: '17px', lineHeight: 1.35, fontWeight: 500 }}>
-                        {w.roast}
+                {categoryWarnings.map(w => {
+                  const bg = w.level === 'exceeded' ? '#D62828'
+                           : w.level === 'reached'  ? '#F77F00'
+                           : '#E5B73B'; // approaching = žlutá
+                  const fg = w.level === 'approaching' ? '#0F0F0E' : '#fff';
+                  return (
+                    <div key={w.cat} className="slide-up" style={{
+                      background: bg, color: fg,
+                      padding: '16px 20px', display: 'flex', alignItems: 'center', gap: '14px'
+                    }}>
+                      <span style={{ fontSize: '22px', flexShrink: 0 }}>{w.emoji}</span>
+                      <div style={{ flex: 1 }}>
+                        <div className="mono" style={{ fontWeight: 800, fontSize: '11px', textTransform: 'uppercase', letterSpacing: '1.5px', marginBottom: '4px', opacity: 0.85 }}>
+                          {w.cat} · {w.label} · {w.pct.toFixed(0)} % · {w.spent.toLocaleString('cs-CZ')}/{w.limit.toLocaleString('cs-CZ')} Kč
+                        </div>
+                        <div className="display" style={{ fontSize: '17px', lineHeight: 1.35, fontWeight: 500 }}>
+                          {w.roast || (
+                            w.level === 'reached'
+                              ? `Vyčerpaný limit kategorie ${w.cat}. Další útrata už zabolí.`
+                              : `Polovinu druhé poloviny už máš pryč. Hlídej se.`
+                          )}
+                        </div>
                       </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
 
@@ -561,7 +717,17 @@ export default function Dashboard({ onLogout }) {
                         return (
                           <button
                             key={entry.name}
-                            onClick={() => setExpandedCategory(expandedCategory === entry.name ? null : entry.name)}
+                            onClick={() => {
+                              const newExpanded = expandedCategory === entry.name ? null : entry.name;
+                              setExpandedCategory(newExpanded);
+                              // Auto-scroll na kategorii v sekci níže
+                              if (newExpanded) {
+                                setTimeout(() => {
+                                  const el = document.getElementById(`cat-${entry.name}`);
+                                  if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                                }, 80);
+                              }
+                            }}
                             style={{
                               background: 'transparent',
                               padding: '6px 8px',
@@ -704,14 +870,14 @@ export default function Dashboard({ onLogout }) {
               </div>
             )}
 
-            {/* Categories */}
-            <div className="card" style={{ padding: '28px', marginBottom: '12px' }}>
+            {/* Categories - seřazené dle % limitu (nejvyšší nahoře) */}
+            <div id="kategorie-sekce" className="card" style={{ padding: '28px', marginBottom: '12px' }}>
               <h3 className="display" style={{ margin: '0 0 8px', fontSize: '28px', fontWeight: 600 }}>Kategorie & limity</h3>
               <div className="mono" style={{ fontSize: '11px', color: '#8A8377', marginBottom: '20px', textTransform: 'uppercase', letterSpacing: '1.5px' }}>
                 Klikni na kategorii pro detail transakcí
               </div>
               <div style={{ display: 'grid', gap: '8px' }}>
-                {allCategories.map((cat, i) => {
+                {categoriesSorted.map((cat, i) => {
                   const st = styleFor(cat, i);
                   const spent = categorySpending[cat] || 0;
                   const limit = categoryLimits[cat] || 0;
@@ -725,7 +891,7 @@ export default function Dashboard({ onLogout }) {
                     .sort((a, b) => b.amount - a.amount);
 
                   return (
-                    <div key={cat} style={{ background: '#0F0F0E', borderLeft: `6px solid ${st.color}`, border: '1px solid #2A2622', overflow: 'hidden' }}>
+                    <div key={cat} id={`cat-${cat}`} style={{ background: '#0F0F0E', borderLeft: `6px solid ${st.color}`, border: '1px solid #2A2622', overflow: 'hidden' }}>
                       <button
                         onClick={() => setExpandedCategory(isExpanded ? null : cat)}
                         style={{
