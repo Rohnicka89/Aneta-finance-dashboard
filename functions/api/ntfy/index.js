@@ -41,6 +41,12 @@ export async function onRequestPost({ request, env }) {
     if (title) headers['Title'] = title;
     if (priority) headers['Priority'] = priority;
     if (tags) headers['Tags'] = tags;
+    
+    // Pokud máme ntfy access token (z env), použij ho pro autentizaci
+    // -> ntfy nás bude počítat jako paying account, ne jako anonymní free
+    if (env.NTFY_TOKEN) {
+      headers['Authorization'] = 'Bearer ' + env.NTFY_TOKEN;
+    }
 
     const ntfyResponse = await fetch(`https://ntfy.sh/${encodeURIComponent(topic)}`, {
       method: 'POST',
