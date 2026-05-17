@@ -1,0 +1,16 @@
+{
+  "name": "aneta-finance-scripts",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "description": "GitHub Action skripty pro automatické zpracování Raiffka výpisů",
+  "scripts": {
+    "process": "node process-statements.js"
+  },
+  "dependencies": {
+    "pdfjs-dist": "3.11.174"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
