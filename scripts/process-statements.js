@@ -13,7 +13,10 @@
  */
 
 import { fetchCiselnik, parseRaiffkaText } from './parser-node.js';
-import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs';
+
+// pdfjs-dist v3.11.174 je CommonJS - musíme přes dynamic import + .default
+const pdfjsModule = await import('pdfjs-dist/legacy/build/pdf.js');
+const pdfjsLib = pdfjsModule.default || pdfjsModule;
 
 // Vypnout worker (Node.js prostředí nemá Web Worker)
 pdfjsLib.GlobalWorkerOptions.workerSrc = null;
