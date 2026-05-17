@@ -1,6 +1,5 @@
 name: Process Raiffka PDF statements
 
-# Spouští se přes Apps Script (repository_dispatch) nebo manuálně z UI
 on:
   repository_dispatch:
     types: [process-statements]
