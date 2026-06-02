@@ -1,21 +1,26 @@
 /**
- * Anetin Finance Dashboard - Gmail → GitHub Actions Bridge
- * =========================================================
- * 
+ * Anetin Finance Dashboard - Gmail → Cloudflare Bridge
+ * =====================================================
+ *
  * Tento skript pouze:
  *   1. Najde v Gmailu nové výpisy z Raiffeisenbank (přeposlané z iCloud)
  *   2. Stáhne PDF přílohy jako base64
- *   3. POSTne je do GitHub Actions přes repository_dispatch
+ *   3. POSTne každé PDF do Cloudflare endpointu /api/pending-pdfs
  *   4. Označí emaily jako "DASHBOARD-PROCESSED"
- * 
- * Veškerou logiku (PDF parsing, kategorizace, upload do D1, ntfy) 
- * dělá GitHub Action - používá stejný pdf.js a parser jako web appka.
- * 
+ *   5. (volitelně) Pošle ntfy notifikaci "Nový výpis čeká na import"
+ *
+ * Vlastní zpracování (PDF parsing, kategorizace, upload do D1) dělá
+ * dashboard v prohlížeči - Aneta ráno otevře appku, klikne "Naimportovat"
+ * a parser.js (pdf.js) spolehlivě zpracuje výpis. Single source of truth.
+ *
+ * Proč ne GitHub Actions? repository_dispatch má limit ~64 KB na payload,
+ * base64 PDF je ~92 KB. Cloudflare endpoint takový limit nemá.
+ *
  * Setup:
  *   1. Script properties:
- *      - GITHUB_TOKEN: Personal Access Token (s 'repo' scope)
- *      - GITHUB_OWNER: tvuj GitHub username (Rohnicka89)
- *      - GITHUB_REPO: jmeno repa (Aneta-finance-dashboard)
+ *      - DASHBOARD_URL: https://aneta-finance-dashboard.pages.dev
+ *      - DASHBOARD_TOKEN: Anetin dashboard token (z localStorage po PIN loginu)
+ *      - NTFY_TOPIC: aneta-fin-saf4kond (volitelné, pro notifikaci)
  *   2. Spusť setup() jednou pro vytvoření labelu
  *   3. Nastav trigger: processNewEmails každý den ráno
  */
@@ -33,9 +38,9 @@ const SEARCH_DAYS = 7;
 function getConfig() {
   const props = PropertiesService.getScriptProperties();
   return {
-    githubToken: props.getProperty('GITHUB_TOKEN'),
-    owner: props.getProperty('GITHUB_OWNER'),
-    repo: props.getProperty('GITHUB_REPO')
+    dashboardUrl: (props.getProperty('DASHBOARD_URL') || '').replace(/\/$/, ''),
+    dashboardToken: props.getProperty('DASHBOARD_TOKEN'),
+    ntfyTopic: props.getProperty('NTFY_TOPIC')
   };
 }
 
@@ -55,35 +60,35 @@ function setup() {
   }
 
   const missing = [];
-  if (!config.githubToken) missing.push('GITHUB_TOKEN');
-  if (!config.owner) missing.push('GITHUB_OWNER');
-  if (!config.repo) missing.push('GITHUB_REPO');
+  if (!config.dashboardUrl) missing.push('DASHBOARD_URL');
+  if (!config.dashboardToken) missing.push('DASHBOARD_TOKEN');
 
   if (missing.length > 0) {
     Logger.log('❌ NUTNO NASTAVIT v Project Settings → Script properties:');
     missing.forEach(function(p) { Logger.log('   - ' + p); });
-    Logger.log('\nGITHUB_TOKEN získáš na github.com/settings/tokens (Personal Access Token, scope: repo)');
+    Logger.log('\nDASHBOARD_URL = https://aneta-finance-dashboard.pages.dev');
+    Logger.log('DASHBOARD_TOKEN = token z localStorage (aneta_auth_token) po PIN loginu');
     return;
   }
 
   Logger.log('✓ Konfigurace OK');
-  Logger.log('  GitHub: ' + config.owner + '/' + config.repo);
-  Logger.log('  Token: ' + config.githubToken.substring(0, 12) + '...');
+  Logger.log('  Dashboard: ' + config.dashboardUrl);
+  Logger.log('  Token: ' + config.dashboardToken.substring(0, 12) + '...');
+  if (config.ntfyTopic) Logger.log('  ntfy topic: ' + config.ntfyTopic);
 
+  // Ověř spojení - GET /api/pending-pdfs (vrátí seznam, prázdný je OK)
   try {
-    const url = 'https://api.github.com/repos/' + config.owner + '/' + config.repo;
-    const r = UrlFetchApp.fetch(url, {
-      headers: {
-        'Authorization': 'token ' + config.githubToken,
-        'Accept': 'application/vnd.github.v3+json'
-      },
+    const r = UrlFetchApp.fetch(config.dashboardUrl + '/api/pending-pdfs', {
+      headers: { 'Authorization': 'Bearer ' + config.dashboardToken },
       muteHttpExceptions: true
     });
     if (r.getResponseCode() === 200) {
-      const repoData = JSON.parse(r.getContentText());
-      Logger.log('✓ GitHub připojení OK. Repo: ' + repoData.full_name);
+      const data = JSON.parse(r.getContentText());
+      Logger.log('✓ Dashboard připojení OK. Čekajících PDF: ' + (data.pdfs ? data.pdfs.length : 0));
+    } else if (r.getResponseCode() === 401) {
+      Logger.log('❌ Dashboard vrátil 401 Unauthorized - zkontroluj DASHBOARD_TOKEN.');
     } else {
-      Logger.log('⚠ GitHub vrátil ' + r.getResponseCode() + ': ' + r.getContentText().substring(0, 200));
+      Logger.log('⚠ Dashboard vrátil ' + r.getResponseCode() + ': ' + r.getContentText().substring(0, 200));
     }
   } catch (e) {
     Logger.log('❌ Chyba: ' + e.message);
@@ -99,7 +104,7 @@ function processNewEmails() {
   Logger.log('=== Spuštěno: ' + startTime.toLocaleString('cs-CZ') + ' ===');
 
   const config = getConfig();
-  if (!config.githubToken || !config.owner || !config.repo) {
+  if (!config.dashboardUrl || !config.dashboardToken) {
     Logger.log('❌ Chybí konfigurace. Spusť setup().');
     return;
   }
@@ -121,15 +126,18 @@ function processNewEmails() {
     return;
   }
 
-  const pdfs = [];
-  const processedThreads = [];
+  let uploadedCount = 0;
+  const uploadedNames = [];
 
   for (const thread of threads) {
     const messages = thread.getMessages();
+    let threadHadPdf = false;
+    let threadAllOk = true;
+
     for (const message of messages) {
       const attachments = message.getAttachments();
-      const messagePdfs = attachments.filter(function(a) { 
-        return a.getName().toLowerCase().indexOf('.pdf') !== -1; 
+      const messagePdfs = attachments.filter(function(a) {
+        return a.getName().toLowerCase().indexOf('.pdf') !== -1;
       });
 
       if (messagePdfs.length === 0) {
@@ -138,60 +146,37 @@ function processNewEmails() {
       }
 
       for (const pdf of messagePdfs) {
+        threadHadPdf = true;
         const base64 = Utilities.base64Encode(pdf.getBytes());
-        pdfs.push({
-          filename: pdf.getName(),
-          data: base64
-        });
-        Logger.log('  📄 ' + pdf.getName() + ' (' + Math.round(pdf.getSize()/1024) + ' KB)');
-      }
-    }
-    processedThreads.push(thread);
-  }
-
-  if (pdfs.length === 0) {
-    Logger.log('Žádné PDFka ke zpracování.');
-    return;
-  }
-
-  Logger.log('\nPosílám ' + pdfs.length + ' PDFek do GitHub Actions...');
-
-  try {
-    const url = 'https://api.github.com/repos/' + config.owner + '/' + config.repo + '/dispatches';
-    const r = UrlFetchApp.fetch(url, {
-      method: 'post',
-      contentType: 'application/json',
-      headers: {
-        'Authorization': 'token ' + config.githubToken,
-        'Accept': 'application/vnd.github.v3+json'
-      },
-      payload: JSON.stringify({
-        event_type: 'process-statements',
-        client_payload: {
-          pdfs: pdfs,
-          timestamp: new Date().toISOString()
-        }
-      }),
-      muteHttpExceptions: true
-    });
-
-    if (r.getResponseCode() === 204) {
-      Logger.log('✓ GitHub Action triggered');
-      
-      for (const thread of processedThreads) {
-        thread.addLabel(label);
-        const messages = thread.getMessages();
-        for (const message of messages) {
-          message.markRead();
+        const ok = uploadPending(config, pdf.getName(), base64);
+        if (ok) {
+          uploadedCount++;
+          uploadedNames.push(pdf.getName());
+          Logger.log('  ✓ ' + pdf.getName() + ' (' + Math.round(pdf.getSize()/1024) + ' KB) → pending');
+        } else {
+          threadAllOk = false;
+          Logger.log('  ❌ ' + pdf.getName() + ' upload selhal');
         }
       }
-      Logger.log('✓ ' + processedThreads.length + ' emailů označeno jako processed');
-    } else {
-      Logger.log('❌ GitHub vrátil ' + r.getResponseCode() + ': ' + r.getContentText().substring(0, 200));
-      Logger.log('Emaily zůstávají neoznčené - skript je při dalším běhu zkusí znovu.');
     }
-  } catch (e) {
-    Logger.log('❌ Chyba: ' + e.message);
+
+    // Označ thread jako processed jen pokud všechna jeho PDF prošla
+    if (threadHadPdf && threadAllOk) {
+      thread.addLabel(label);
+      const messages2 = thread.getMessages();
+      for (const m of messages2) m.markRead();
+    } else if (!threadAllOk) {
+      Logger.log('⚠ Thread neoznačen (některé PDF selhalo) - zkusí se znovu příště.');
+    }
+  }
+
+  Logger.log('\n✓ Nahráno ' + uploadedCount + ' PDF do fronty.');
+
+  // Volitelná notifikace
+  if (uploadedCount > 0 && config.ntfyTopic) {
+    sendNtfy(config,
+      '📥 ' + uploadedCount + ' ' + (uploadedCount === 1 ? 'nový výpis' : 'nových výpisů'),
+      'Otevři dashboard a klikni na import: ' + uploadedNames.join(', '));
   }
 
   const duration = Math.round((new Date() - startTime) / 1000);
@@ -199,57 +184,61 @@ function processNewEmails() {
 }
 
 // ============================================================================
-// Test funkce
+// HELPERY
 // ============================================================================
 
-function testGitHubConnection() {
-  const config = getConfig();
-  if (!config.githubToken) {
-    Logger.log('❌ Chybí GITHUB_TOKEN');
-    return;
-  }
-  const url = 'https://api.github.com/repos/' + config.owner + '/' + config.repo;
-  const r = UrlFetchApp.fetch(url, {
-    headers: {
-      'Authorization': 'token ' + config.githubToken,
-      'Accept': 'application/vnd.github.v3+json'
-    },
-    muteHttpExceptions: true
-  });
-  Logger.log('Status: ' + r.getResponseCode());
-  if (r.getResponseCode() === 200) {
-    const d = JSON.parse(r.getContentText());
-    Logger.log('Repo: ' + d.full_name);
-    Logger.log('Default branch: ' + d.default_branch);
-  } else {
-    Logger.log('Error: ' + r.getContentText().substring(0, 500));
+function uploadPending(config, filename, base64) {
+  try {
+    const r = UrlFetchApp.fetch(config.dashboardUrl + '/api/pending-pdfs', {
+      method: 'post',
+      contentType: 'application/json',
+      headers: { 'Authorization': 'Bearer ' + config.dashboardToken },
+      payload: JSON.stringify({ filename: filename, data: base64 }),
+      muteHttpExceptions: true
+    });
+    if (r.getResponseCode() === 200) return true;
+    Logger.log('    Dashboard vrátil ' + r.getResponseCode() + ': ' + r.getContentText().substring(0, 200));
+    return false;
+  } catch (e) {
+    Logger.log('    Chyba uploadu: ' + e.message);
+    return false;
   }
 }
 
-function testDispatch() {
-  const config = getConfig();
-  if (!config.githubToken) { Logger.log('❌ Chybí GITHUB_TOKEN'); return; }
+// ntfy přes Cloudflare proxy (/api/ntfy přidá Authorization s NTFY_TOKEN)
+// POZN: endpoint očekává pole "body" pro text zprávy (ne "message")
+function sendNtfy(config, title, message) {
+  try {
+    const r = UrlFetchApp.fetch(config.dashboardUrl + '/api/ntfy', {
+      method: 'post',
+      contentType: 'application/json',
+      headers: { 'Authorization': 'Bearer ' + config.dashboardToken },
+      payload: JSON.stringify({ topic: config.ntfyTopic, title: title, body: message }),
+      muteHttpExceptions: true
+    });
+    Logger.log('  ntfy status: ' + r.getResponseCode());
+  } catch (e) {
+    Logger.log('  ntfy chyba: ' + e.message);
+  }
+}
 
-  const url = 'https://api.github.com/repos/' + config.owner + '/' + config.repo + '/dispatches';
-  const r = UrlFetchApp.fetch(url, {
-    method: 'post',
-    contentType: 'application/json',
-    headers: {
-      'Authorization': 'token ' + config.githubToken,
-      'Accept': 'application/vnd.github.v3+json'
-    },
-    payload: JSON.stringify({
-      event_type: 'process-statements',
-      client_payload: {
-        pdfs: [],
-        test: true
-      }
-    }),
+// ============================================================================
+// Test funkce
+// ============================================================================
+
+function testDashboardConnection() {
+  const config = getConfig();
+  if (!config.dashboardToken) { Logger.log('❌ Chybí DASHBOARD_TOKEN'); return; }
+  const r = UrlFetchApp.fetch(config.dashboardUrl + '/api/pending-pdfs', {
+    headers: { 'Authorization': 'Bearer ' + config.dashboardToken },
     muteHttpExceptions: true
   });
   Logger.log('Status: ' + r.getResponseCode());
-  Logger.log('Response: ' + r.getContentText().substring(0, 200));
-  if (r.getResponseCode() === 204) {
-    Logger.log('✓ Dispatch poslán. Mrkni v GitHubu na Actions tab.');
-  }
+  Logger.log('Response: ' + r.getContentText().substring(0, 300));
+}
+
+function testNtfy() {
+  const config = getConfig();
+  if (!config.ntfyTopic) { Logger.log('❌ Chybí NTFY_TOPIC'); return; }
+  sendNtfy(config, '🧪 Test', 'Notifikace z Apps Scriptu funguje.');
 }

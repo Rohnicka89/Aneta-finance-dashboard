@@ -18,10 +18,10 @@ const loadPdfJs = async () => {
   return pdfjsLib;
 };
 
-export const extractPdfText = async (file) => {
+// Jádro - extrahuje text z ArrayBuffer / TypedArray
+const extractTextFromData = async (data) => {
   const lib = await loadPdfJs();
-  const arrayBuffer = await file.arrayBuffer();
-  const pdf = await lib.getDocument({ data: arrayBuffer }).promise;
+  const pdf = await lib.getDocument({ data }).promise;
   let fullText = '';
   for (let i = 1; i <= pdf.numPages; i++) {
     const page = await pdf.getPage(i);
@@ -30,6 +30,19 @@ export const extractPdfText = async (file) => {
     fullText += pageText + '\n';
   }
   return fullText;
+};
+
+export const extractPdfText = async (file) => {
+  const arrayBuffer = await file.arrayBuffer();
+  return extractTextFromData(arrayBuffer);
+};
+
+// Varianta pro PDF přicházející jako base64 (z pending fronty / Apps Scriptu)
+export const extractPdfTextFromBase64 = async (base64) => {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return extractTextFromData(bytes);
 };
 
 export const extractMerchant = (note) => {
