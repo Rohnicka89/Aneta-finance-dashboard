@@ -111,6 +111,29 @@ export const deleteAllTransactions = async () => {
 };
 
 // =============================================================================
+// PENDING PDFs endpoints (výpisy nahrané Apps Scriptem, čekající na import)
+// =============================================================================
+
+export const fetchPendingPdfs = async () => {
+  try {
+    const result = await apiFetch('/pending-pdfs');
+    return result.pdfs || [];
+  } catch (e) {
+    console.warn('Fetch pending PDFs failed:', e.message);
+    return [];
+  }
+};
+
+export const deletePendingPdf = async (id) => {
+  try {
+    return await apiFetch(`/pending-pdfs?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
+  } catch (e) {
+    console.warn('Delete pending PDF failed:', e.message);
+    return { offline: true };
+  }
+};
+
+// =============================================================================
 // SETTINGS endpoints (limity, pin nastavení atd.)
 // =============================================================================
 

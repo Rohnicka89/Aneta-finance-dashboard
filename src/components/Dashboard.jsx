@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip, LineChart, Line, CartesianGrid, XAxis, YAxis, Legend } from 'recharts';
 import { Upload, Settings, X, Skull, ChevronDown, ChevronUp, AlertTriangle, ArrowRightLeft, FileText, Trash2, RefreshCw, LogOut } from 'lucide-react';
 
-import { extractPdfText, parseRaiffkaText } from '../lib/parser.js';
+import { extractPdfText, extractPdfTextFromBase64, parseRaiffkaText } from '../lib/parser.js';
 import { fetchCiselnik, categorize } from '../lib/ciselnik.js';
 import { styleFor, CATEGORY_STYLE } from '../lib/categories.js';
 import { getRoast, getCategoryRoast } from '../lib/roasts.js';
@@ -19,6 +19,8 @@ export default function Dashboard({ onLogout }) {
   const [parsing, setParsing] = useState(false);
   const [parseStatus, setParseStatus] = useState('');
   const [parseError, setParseError] = useState(null);
+  const [pendingPdfs, setPendingPdfs] = useState([]);
+  const [importingPending, setImportingPending] = useState(false);
   const [showSubs, setShowSubs] = useState(false);
   const [showTransfers, setShowTransfers] = useState(false);
   const [debugText, setDebugText] = useState('');
@@ -48,6 +50,11 @@ export default function Dashboard({ onLogout }) {
         const settings = await api.fetchSettings();
         if (settings.totalLimit) setTotalLimit(settings.totalLimit);
         if (settings.categoryLimits) setCategoryLimits(settings.categoryLimits);
+      } catch (e) { console.error(e); }
+      // Čekající výpisy z Apps Scriptu (e-mailové forwardy)
+      try {
+        const pending = await api.fetchPendingPdfs();
+        if (Array.isArray(pending)) setPendingPdfs(pending);
       } catch (e) { console.error(e); }
       // Cached číselník
       const cisCache = localStorage.getItem('cache_ciselnik');
@@ -304,6 +311,90 @@ export default function Dashboard({ onLogout }) {
 
   const triggerFileSelect = () => fileInputRef.current?.click();
 
+  // Import výpisů, které Apps Script nahrál do fronty (pending_pdfs v D1).
+  // Parsuje se v prohlížeči přes stejný pdf.js jako manuální upload.
+  const importPending = async () => {
+    if (pendingPdfs.length === 0 || importingPending) return;
+    setImportingPending(true);
+    setParseError(null);
+    setDebugText('');
+
+    let totalParsed = 0;
+    let totalNew = 0;
+    let totalDuplicate = 0;
+    const errors = [];
+    const processedIds = [];
+
+    const existingIds = new Set(transactions.map(t => t.id));
+    const allNewTransactions = [];
+
+    for (let idx = 0; idx < pendingPdfs.length; idx++) {
+      const item = pendingPdfs[idx];
+      setParseStatus(`📥 ${idx + 1}/${pendingPdfs.length}: ${item.filename}`);
+      try {
+        await new Promise(r => setTimeout(r, 50));
+        const text = await extractPdfTextFromBase64(item.data_base64);
+
+        if (!text || text.length < 100) {
+          errors.push(`${item.filename}: PDF má jen ${text.length} znaků - asi je to scan.`);
+          continue;
+        }
+
+        const txs = parseRaiffkaText(text, patterns, accounts);
+        totalParsed += txs.length;
+
+        if (txs.length === 0) {
+          errors.push(`${item.filename}: žádné transakce nerozpoznány.`);
+          // I tak ho odstraníme z fronty, ať nezůstává viset
+          processedIds.push(item.id);
+          continue;
+        }
+
+        for (const tx of txs) {
+          if (existingIds.has(tx.id)) {
+            totalDuplicate++;
+          } else {
+            existingIds.add(tx.id);
+            allNewTransactions.push(tx);
+            totalNew++;
+          }
+        }
+        processedIds.push(item.id);
+      } catch (err) {
+        console.error(err);
+        errors.push(`${item.filename}: ${err.message || err.toString()}`);
+      }
+    }
+
+    if (allNewTransactions.length > 0) {
+      const merged = [...transactions, ...allNewTransactions];
+      setTransactions(merged);
+      await api.saveTransactions(merged);
+    }
+
+    // Smaž z fronty ty, co se podařilo zpracovat (i prázdné)
+    for (const id of processedIds) {
+      await api.deletePendingPdf(id);
+    }
+    // Obnov frontu z backendu (ponechá ty, co selhaly)
+    try {
+      const refreshed = await api.fetchPendingPdfs();
+      if (Array.isArray(refreshed)) setPendingPdfs(refreshed);
+    } catch (e) {
+      setPendingPdfs(prev => prev.filter(p => !processedIds.includes(p.id)));
+    }
+
+    const summary = `${pendingPdfs.length} ${pendingPdfs.length === 1 ? 'výpis' : 'výpisů'} · ${totalNew} nových · ${totalDuplicate} duplikátů`;
+    if (errors.length > 0) {
+      setParseError(`Některé výpisy selhaly:\n${errors.join('\n')}`);
+      setParseStatus(`⚠️ ${summary}, ${errors.length} chyb`);
+    } else {
+      setParseStatus(`✅ Naimportováno: ${summary}`);
+    }
+
+    setImportingPending(false);
+  };
+
   const updateCategoryLimit = async (cat, value) => {
     const updated = { ...categoryLimits, [cat]: parseFloat(value) || 0 };
     setCategoryLimits(updated);
@@ -441,6 +532,40 @@ export default function Dashboard({ onLogout }) {
             </div>
           </div>
         </header>
+
+        {/* Pending výpisy z e-mailu (Apps Script bridge) */}
+        {pendingPdfs.length > 0 && (
+          <div className="slide-up" style={{
+            background: '#E5B73B', color: '#0F0F0E',
+            padding: '20px 24px', marginBottom: '16px',
+            display: 'flex', alignItems: 'center', gap: '16px', flexWrap: 'wrap',
+            boxShadow: '6px 6px 0 #0F0F0E'
+          }}>
+            <FileText size={28} style={{ flexShrink: 0 }} />
+            <div style={{ flex: 1, minWidth: '200px' }}>
+              <div className="display" style={{ fontSize: '20px', fontWeight: 700, lineHeight: 1.2 }}>
+                {pendingPdfs.length} {pendingPdfs.length === 1 ? 'nový výpis čeká' : pendingPdfs.length < 5 ? 'nové výpisy čekají' : 'nových výpisů čeká'} na import
+              </div>
+              <div className="mono" style={{ fontSize: '11px', marginTop: '4px', opacity: 0.75 }}>
+                {pendingPdfs.map(p => p.filename).join(' · ')}
+              </div>
+            </div>
+            <button
+              onClick={importPending}
+              disabled={importingPending}
+              style={{
+                background: '#0F0F0E', color: '#E5B73B',
+                padding: '14px 24px', fontWeight: 800, textTransform: 'uppercase',
+                letterSpacing: '1.5px', fontSize: '13px',
+                display: 'inline-flex', alignItems: 'center', gap: '8px',
+                opacity: importingPending ? 0.6 : 1, flexShrink: 0
+              }}
+            >
+              <Upload size={16} />
+              {importingPending ? 'Importuji…' : 'Naimportovat'}
+            </button>
+          </div>
+        )}
 
         {/* Číselník status */}
         {(ciselnikStatus || patterns.length > 0) && (
